@@ -12,7 +12,7 @@
     <style>
         /* ===== BASE STYLES (Daraz-like) ===== */
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Roboto, sans-serif; }
-        :root { --primary: #f85606; --primary-dark: #d94a00; --primary-light: #fff0e8; --gray: #717171; --shadow: 0 2px 8px rgba(0,0,0,0.08); --radius: 12px; }
+        :root { --primary: #f85606; --primary-dark: #d94a00; --primary-light: #fff0e8; --gray: #717171; --light-gray: #f5f5f5; --success: #27ae60; --danger: #e74c3c; --shadow: 0 2px 8px rgba(0,0,0,0.08); --radius: 12px; }
         body { background: #f1f3f6; padding-bottom: 70px; padding-top: 56px; min-height: 100vh; }
 
         /* Header */
@@ -187,7 +187,7 @@
             <div id="guestTracking">
                 <div style="background:white; border-radius:var(--radius); padding:16px; box-shadow:var(--shadow);">
                     <p style="font-weight:600; margin-bottom:8px;">🔍 Track Order (Guest)</p>
-                    <input type="text" id="trackOrderId" placeholder="Order ID (e.g. abc123)" />
+                    <input type="text" id="trackOrderId" placeholder="Full Order ID (shown after checkout)" />
                     <input type="tel" id="trackPhone" placeholder="Phone Number" />
                     <button class="btn-submit" onclick="trackOrder()" style="margin-top:4px;">🔍 Track</button>
                     <div id="trackResult" style="margin-top:12px;"></div>
@@ -291,6 +291,11 @@
             measurementId: "G-CS71VKBEYL"
         };
 
+        if (typeof firebase === 'undefined') {
+            document.body.innerHTML = '<div style="padding:40px 20px; text-align:center; color:#e74c3c;"><h2>⚠️ Could not load required scripts</h2><p style="color:#666; margin-top:8px;">Please check your internet connection and reload the page.</p><button onclick="location.reload()" style="margin-top:16px; padding:10px 24px; background:#f85606; color:white; border:none; border-radius:30px; font-weight:700;">🔄 Reload</button></div>';
+            throw new Error('Firebase SDK failed to load');
+        }
+
         firebase.initializeApp(firebaseConfig);
         const auth = firebase.auth();
         const db = firebase.firestore();
@@ -313,6 +318,20 @@
             if (cleaned.startsWith('0')) cleaned = '92' + cleaned.substring(1);
             else if (!cleaned.startsWith('92')) cleaned = '92' + cleaned;
             return cleaned;
+        }
+
+        // Rejects white / near-white colors so the orange theme (and white button text)
+        // never becomes invisible if an admin accidentally sets a light primaryColor.
+        function isColorSafe(color) {
+            const probe = document.createElement('div');
+            probe.style.color = color;
+            document.body.appendChild(probe);
+            const rgb = getComputedStyle(probe).color.match(/\d+/g);
+            document.body.removeChild(probe);
+            if (!rgb) return false;
+            const [r, g, b] = rgb.map(Number);
+            const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+            return brightness < 235; // too close to white = unsafe (white text would vanish)
         }
 
         // ============================================================
@@ -341,7 +360,7 @@
                         document.getElementById('storeName').innerHTML = `🛍️ ${storeSettings.martName}`;
                         document.title = storeSettings.martName + ' - Dera Murad Jamali';
                     }
-                    if (storeSettings.primaryColor) {
+                    if (storeSettings.primaryColor && isColorSafe(storeSettings.primaryColor)) {
                         document.documentElement.style.setProperty('--primary', storeSettings.primaryColor);
                     }
                     if (storeSettings.locations) availableLocations = storeSettings.locations;
@@ -369,9 +388,12 @@
 
         async function loadBanners() {
             try {
-                const snap = await db.collection('banners').where('status', '==', 'active').orderBy('order', 'asc').get();
+                // Simple where-only query (no orderBy combo) - avoids needing a
+                // composite index, same fix already applied to loadProducts().
+                const snap = await db.collection('banners').where('status', '==', 'active').get();
                 banners = [];
                 snap.forEach(d => banners.push({ id: d.id, ...d.data() }));
+                banners.sort((a, b) => (a.order || 0) - (b.order || 0));
                 if (banners.length === 0) {
                     banners = [{ title: '🔥 Flash Sale', subtitle: 'Up to 50% off!', emoji: '🔥', color: '#f85606' }];
                 }
@@ -481,10 +503,8 @@
                 showToast('Welcome back!');
                 if (remember) {
                     localStorage.setItem('rememberedEmail', email);
-                    localStorage.setItem('rememberedPassword', password);
                 } else {
                     localStorage.removeItem('rememberedEmail');
-                    localStorage.removeItem('rememberedPassword');
                 }
             } catch (err) {
                 showToast('❌ ' + err.message, 'error');
@@ -944,7 +964,8 @@
                 renderCart();
                 closeModal('checkoutModal');
 
-                showToast('✅ Order placed! #' + orderRef.id.slice(-6));
+                showToast('✅ Order placed! Save this ID: ' + orderRef.id);
+                localStorage.setItem('myLastOrderId', orderRef.id);
                 navigateTo('orders');
 
                 // WhatsApp to admin
@@ -1038,19 +1059,15 @@ ${currentUser ? '✅ Registered' : '👤 Guest'}`;
             }
             result.innerHTML = 'Searching...';
             try {
-                const snap = await db.collection('orders').where('buyerPhone', '==', phone).get();
-                let found = null;
-                snap.forEach(doc => {
-                    const id = doc.id;
-                    if (id.startsWith(orderId) || id.slice(-6) === orderId) {
-                        found = { id: doc.id, ...doc.data() };
-                    }
-                });
-                if (!found) {
-                    result.innerHTML = '<p style="color:#e74c3c;">No order found.</p>';
+                // Guests can only fetch a single order by its FULL document ID
+                // (security rules block listing/querying all orders for guests).
+                const doc = await db.collection('orders').doc(orderId).get();
+                if (!doc.exists || cleanPhoneNumber(doc.data().buyerPhone) !== cleanPhoneNumber(phone)) {
+                    result.innerHTML = '<p style="color:#e74c3c;">No order found. Check the full Order ID and phone number.</p>';
                     return;
                 }
-                const o = found;
+                const o = { id: doc.id, ...doc.data() };
+                const canCancel = o.status === 'pending' && new Date((o.createdAt?.toDate?.()?.getTime() || 0) + 24 * 60 * 60 * 1000) > new Date();
                 result.innerHTML = `
                     <div style="background:#f8f9fa; border-radius:12px; padding:16px;">
                         <div style="font-weight:700;">🆔 #${o.id.slice(-6)}</div>
@@ -1058,7 +1075,7 @@ ${currentUser ? '✅ Registered' : '👤 Guest'}`;
                         <div style="font-weight:800;">Rs. ${o.total.toLocaleString()}</div>
                         <div><span class="order-status">${(o.status || 'pending').toUpperCase()}</span></div>
                         <div style="font-size:11px; color:#999;">${o.buyerName}, ${o.buyerAddress}</div>
-                        ${o.status === 'pending' ? `<button class="cancel-btn" onclick="cancelGuestOrder('${o.id}')">❌ Cancel</button>` : ''}
+                        ${canCancel ? `<button class="cancel-btn" onclick="cancelGuestOrder('${o.id}')">❌ Cancel</button>` : ''}
                     </div>
                 `;
             } catch (e) {
@@ -1102,12 +1119,10 @@ ${currentUser ? '✅ Registered' : '👤 Guest'}`;
         (async function init() {
             await loadStoreSettings();
             await loadBanners();
-            // Check remembered credentials
+            // Check remembered email (we no longer store passwords for security)
             const rememberedEmail = localStorage.getItem('rememberedEmail');
-            const rememberedPassword = localStorage.getItem('rememberedPassword');
-            if (rememberedEmail && rememberedPassword) {
+            if (rememberedEmail) {
                 document.getElementById('loginEmail').value = rememberedEmail;
-                document.getElementById('loginPassword').value = rememberedPassword;
                 document.getElementById('rememberMe').checked = true;
             }
             // Load products initially
